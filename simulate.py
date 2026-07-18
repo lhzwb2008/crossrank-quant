@@ -12,11 +12,11 @@
 
 策略复刻自 backtest.py 的 INTRADAY 模式（与回测同口径）：
   - 池子：NAS100 ∪ S&P 500（universe.get_universe()）
-  - 信号：mom_20/60 + IBS/Williams%R/rev_5 + EMA9/21 bias，rank 化合成 composite
+  - 信号：mom_20/60/120 + IBS/Williams%R/rev_5/RSI + EMA9/21 bias，rank 化合成 composite
   - 决策时点：美东 15:50（DECISION_TIME_ET）
   - 入场：top K_LONG 缺位的 → 市价开多
   - 平仓：跌出 top (K * HYSTERESIS_MULT) / 持仓满 MAX_HOLD_DAYS / SPY 200DMA 翻空
-  - 止损：max(5%, 1.5×ATR14)，盘中每分钟用实时报价 vs 本地 stop_price 检查
+  - 止损：max(4%, 2.5×ATR14)，盘中每分钟用实时报价 vs 本地 stop_price 检查
 
 运行：
     python simulate.py                # 守护进程：盘中每分钟检查止损，15:50 决策
@@ -63,13 +63,16 @@ load_dotenv()
 # ============================================================================
 #                              策略参数（与 backtest.py 同步）
 # ============================================================================
-K_LONG               = 10
-HYSTERESIS_MULT      = 4.0
-MOM_WEIGHT           = 0.8
-BIAS_WEIGHT          = 0.3
-STOP_LOSS_PCT        = 0.05
-STOP_LOSS_ATR_MULT   = 1.5
-MAX_HOLD_DAYS        = 80
+# Calmar 优化后默认（2026-07）：mom_120 + RSI，K=12，hyst=2.5，止损 4%/2.5×ATR
+K_LONG               = 12
+HYSTERESIS_MULT      = 2.5
+MOM_WEIGHT           = 0.9
+BIAS_WEIGHT          = 0.4
+USE_RSI_REV          = True
+USE_MOM_120          = True
+STOP_LOSS_PCT        = 0.04
+STOP_LOSS_ATR_MULT   = 2.5
+MAX_HOLD_DAYS        = 60
 MIN_DOLLAR_VOLUME    = 5e7
 REGIME_FILTER        = True
 INTRADAY_PERIOD      = "5min"
@@ -103,6 +106,14 @@ def _williams_r(h, l, c, n=14):
     return -100 * (hh - c) / (hh - ll).replace(0, np.nan)
 
 
+def _rsi(c, n=14):
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(n).mean()
+    loss = (-delta.clip(upper=0)).rolling(n).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     h, l, c = out["high"], out["low"], out["close"]
@@ -111,10 +122,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["trend_up"] = (out["ema9"] > out["ema21"]).astype(float)
     out["mom_20"] = c / c.shift(20) - 1
     out["mom_60"] = c / c.shift(60) - 1
+    out["mom_120"] = c / c.shift(120) - 1
     out["rev_5"]  = -(c / c.shift(5) - 1)
     rng = (h - l).replace(0, np.nan)
     out["ibs"]    = (c - l) / rng
     out["wr14"]   = _williams_r(h, l, c, 14)
+    out["rsi14"]  = _rsi(c, 14)
     out["atr14"]  = _atr(h, l, c, 14)
     out["dollar_vol_20"] = (c * out["volume"]).rolling(20).mean()
     return out
@@ -135,6 +148,7 @@ def compute_proxy_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     out.loc[valid, "mom_20"] = pd_c[valid] / out["close"].shift(20)[valid] - 1
     out.loc[valid, "mom_60"] = pd_c[valid] / out["close"].shift(60)[valid] - 1
+    out.loc[valid, "mom_120"] = pd_c[valid] / out["close"].shift(120)[valid] - 1
     out.loc[valid, "rev_5"]  = -(pd_c[valid] / out["close"].shift(5)[valid] - 1)
 
     rng = (pd_h - pd_l).replace(0, np.nan)
@@ -144,6 +158,10 @@ def compute_proxy_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ll14 = pd.concat([out["low"].shift(1).rolling(13).min(), pd_l], axis=1).min(axis=1)
     rng14 = (hh14 - ll14).replace(0, np.nan)
     out.loc[valid, "wr14"] = (-100 * (hh14 - pd_c) / rng14)[valid]
+
+    close_proxy = out["close"].copy()
+    close_proxy.loc[valid] = pd_c[valid]
+    out.loc[valid, "rsi14"] = _rsi(close_proxy, 14)[valid]
 
     prev_c = out["close"].shift(1)
     past_tr = pd.concat([
@@ -176,15 +194,25 @@ def _csrank(s):
 
 
 def composite_score(day_panel: pd.DataFrame, mom_w=MOM_WEIGHT,
-                    bias_w=BIAS_WEIGHT) -> pd.Series:
+                    bias_w=BIAS_WEIGHT, use_rsi_rev: bool = USE_RSI_REV,
+                    use_mom_120: bool = USE_MOM_120) -> pd.Series:
     s_mom20 = _csrank(day_panel["mom_20"])
     s_mom60 = _csrank(day_panel["mom_60"])
+    if use_mom_120 and "mom_120" in day_panel.columns:
+        s_mom120 = _csrank(day_panel["mom_120"])
+        momentum = (s_mom20 + s_mom60 + s_mom120) / 3
+    else:
+        momentum = (s_mom20 + s_mom60) / 2
+
     s_ibs   = -_csrank(day_panel["ibs"])
     s_wr    = -_csrank(-day_panel["wr14"])
     s_rev   = _csrank(day_panel["rev_5"])
-    bias    = day_panel["trend_up"].fillna(0.5) * 2 - 1
-    momentum = (s_mom20 + s_mom60) / 2
-    reversal = (s_ibs + s_wr + s_rev) / 3
+    rev_parts = [s_ibs, s_wr, s_rev]
+    if use_rsi_rev and "rsi14" in day_panel.columns:
+        rev_parts.append(-_csrank(day_panel["rsi14"]))
+    reversal = sum(rev_parts) / len(rev_parts)
+
+    bias = day_panel["trend_up"].fillna(0.5) * 2 - 1
     return mom_w * momentum + (1 - mom_w) * reversal + bias_w * bias
 
 
@@ -912,10 +940,13 @@ def main():
     )
     args = ap.parse_args()
 
-    log.info(f"参数: K_LONG={K_LONG} mom_w={MOM_WEIGHT} bias_w={BIAS_WEIGHT} "
-             f"hyst={HYSTERESIS_MULT}x stop=max({STOP_LOSS_PCT*100:.0f}%,"
-             f"{STOP_LOSS_ATR_MULT}×ATR) max_hold={MAX_HOLD_DAYS}d "
-             f"regime={REGIME_FILTER} decision={DECISION_TIME_ET} ET")
+    log.info(
+        f"参数: K_LONG={K_LONG} mom_w={MOM_WEIGHT} bias_w={BIAS_WEIGHT} "
+        f"rsi={'Y' if USE_RSI_REV else 'N'} m120={'Y' if USE_MOM_120 else 'N'} "
+        f"hyst={HYSTERESIS_MULT}x stop=max({STOP_LOSS_PCT*100:.0f}%,"
+        f"{STOP_LOSS_ATR_MULT}×ATR) max_hold={MAX_HOLD_DAYS}d "
+        f"regime={REGIME_FILTER} decision={DECISION_TIME_ET} ET"
+    )
 
     if args.cancel_orders:
         broker = Broker()

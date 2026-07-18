@@ -5,9 +5,9 @@
 
 策略简介：
 - 池子：NAS100 ∪ S&P 500 静态成分（[`universe.py`](universe.py)），每日按 20D 平均成交额过滤 ≥ $50M
-- 信号：动量 (mom_20/mom_60) + 反转 (IBS / Williams%R / rev_5)，rank 化聚合
+- 信号：动量 (mom_20/60/120) + 反转 (IBS / Williams%R / rev_5 / RSI) + EMA bias，rank 化聚合
 - 入场：横截面 composite 分数 top K_LONG 做多
-- 出场：止损（max(5%, 1.5×ATR)）/ 持仓 MAX_HOLD_DAYS 到期 / 信号退出 hysteresis 带（4×K）
+- 出场：止损（max(4%, 2.5×ATR)）/ 持仓 MAX_HOLD_DAYS 到期 / 信号退出 hysteresis 带（2.5×K）
 - 大盘 regime 过滤：仅 SPY > 200DMA 时开新多头
 - 波动率目标仓位：按近 20D 组合波动反向缩放仓位（高波动减仓、低波动加仓）
 - 交易成本：Longport 美股平台费 $0.005/股 (min $1) + SEC 0.0000278% + TAF $0.000166/股
@@ -35,7 +35,7 @@ BACKTEST_END  = "today"             # 共同终点："today" 或 "YYYY-MM-DD"
 STARTING_CAPITAL = 100000           # 起始本金（美元），仅用于显示与 P&L 美元金额
 
 # ---- 持仓结构 ----
-K_LONG  = 10                        # 最多同时持有的多头数
+K_LONG  = 12                        # 最多同时持有的多头数（Calmar 优化后）
 K_SHORT = 0                         # 最多同时持有的空头数（0 = 纯多头，默认）
 LONG_WEIGHT_FRAC = 1.0              # 多头占 gross 的比例；空头占 (1 - 此值)
                                     #   1.0  = 纯多头（默认；建议同时 K_SHORT=0）
@@ -44,25 +44,27 @@ LONG_WEIGHT_FRAC = 1.0              # 多头占 gross 的比例；空头占 (1 -
 GROSS_LEVERAGE = 1.0                # 总毛敞口（long + |short|）
 
 # ---- 信号聚合 ----
-MOM_WEIGHT  = 0.8                   # 动量信号权重；反转 = 1 - 此值
-                                    # NAS100 趋势市场实验显示 0.7-0.8 优于 0.5
-BIAS_WEIGHT = 0.3                   # EMA9/21 趋势 bias 系数
+MOM_WEIGHT  = 0.9                   # 动量信号权重；反转 = 1 - 此值
+BIAS_WEIGHT = 0.4                   # EMA9/21 趋势 bias 系数
+RISK_WEIGHT = 0.0                   # 低波动倾斜权重；>0 时偏好低 vol 标的（利于 Calmar）
+USE_RSI_REV = True                  # True 时把 RSI(14) 并入反转块（偏好超卖）
+USE_MOM_120 = True                  # True 时动量块加入 mom_120
 
 # ---- Hysteresis 与持仓维持 ----
-HYSTERESIS_MULT = 4.0               # 持仓需 score 退出 top/bottom (mult * K) 才平仓
+HYSTERESIS_MULT = 2.5               # 持仓需 score 退出 top/bottom (mult * K) 才平仓
                                     # 越大换手越低；2 几乎不滞后，4 月换手降到合理水平
 
 # ---- 风控 ----
-STOP_LOSS_PCT      = 0.05           # 个股止损百分比下限
-STOP_LOSS_ATR_MULT = 1.5            # 个股止损 ATR 倍数；实际止损 = max(pct, ATR mult)
-MAX_HOLD_DAYS      = 80             # 最大持仓天数（参数扫描显示 60-120 优于 20）
+STOP_LOSS_PCT      = 0.04           # 个股止损百分比下限
+STOP_LOSS_ATR_MULT = 2.5            # 个股止损 ATR 倍数；实际止损 = max(pct, ATR mult)
+MAX_HOLD_DAYS      = 60             # 最大持仓天数
 MIN_DOLLAR_VOLUME  = 5e7            # 流动性过滤：20D 平均成交额下限（美元）
 
 # ---- 大盘 regime 过滤 ----
 REGIME_FILTER = True                # True 时启用 SPY 200DMA：上方仅开多，下方仅开空（关闭时全开）
 
 # ---- 波动率目标仓位 ----
-VOL_TARGET_ANNUAL = 0.20            # 目标年化波动；0 = 关闭。开仓时按 (target / realized_vol) 缩放
+VOL_TARGET_ANNUAL = 0.25            # 目标年化波动；0 = 关闭。开仓时按 (target / realized_vol) 缩放
 VOL_TARGET_LOOKBACK = 20            # 计算已实现组合波动的滚动窗口
 VOL_SCALE_MIN = 0.3                 # 缩放下限（高波动期最多压到原 30%）
 VOL_SCALE_MAX = 2.0                 # 缩放上限（低波动期最多放大到 200%）
@@ -123,6 +125,9 @@ class Config:
     min_dollar_volume: float = MIN_DOLLAR_VOLUME
     mom_weight: float = MOM_WEIGHT
     bias_weight: float = BIAS_WEIGHT
+    risk_weight: float = RISK_WEIGHT
+    use_rsi_rev: bool = USE_RSI_REV
+    use_mom_120: bool = USE_MOM_120
     regime_filter: bool = REGIME_FILTER
     vol_target_annual: float = VOL_TARGET_ANNUAL
     vol_target_lookback: int = VOL_TARGET_LOOKBACK
@@ -279,6 +284,14 @@ def _williams_r(h, l, c, n=14):
     return -100 * (hh - c) / (hh - ll).replace(0, np.nan)
 
 
+def _rsi(c, n=14):
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(n).mean()
+    loss = (-delta.clip(upper=0)).rolling(n).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     h, l, c = out["high"], out["low"], out["close"]
@@ -287,10 +300,13 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["trend_up"] = (out["ema9"] > out["ema21"]).astype(float)
     out["mom_20"] = c / c.shift(20) - 1
     out["mom_60"] = c / c.shift(60) - 1
+    out["mom_120"] = c / c.shift(120) - 1
     out["rev_5"] = -(c / c.shift(5) - 1)
     rng = (h - l).replace(0, np.nan)
     out["ibs"] = (c - l) / rng
     out["wr14"] = _williams_r(h, l, c, 14)
+    out["rsi14"] = _rsi(c, 14)
+    out["vol_20"] = c.pct_change().rolling(20).std() * np.sqrt(252)
     out["atr14"] = _atr(h, l, c, 14)
     out["dollar_vol_20"] = (c * out["volume"]).rolling(20).mean()
     return out
@@ -325,15 +341,24 @@ def compute_proxy_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # 动量 / 反转：替换今日分子
     out.loc[valid, "mom_20"] = pd_c[valid] / out["close"].shift(20)[valid] - 1
     out.loc[valid, "mom_60"] = pd_c[valid] / out["close"].shift(60)[valid] - 1
+    out.loc[valid, "mom_120"] = pd_c[valid] / out["close"].shift(120)[valid] - 1
     out.loc[valid, "rev_5"]  = -(pd_c[valid] / out["close"].shift(5)[valid] - 1)
 
-    # IBS / Williams%R 用日内 H/L
+    # IBS / Williams%R / RSI 用日内截面
     rng = (pd_h - pd_l).replace(0, np.nan)
     out.loc[valid, "ibs"] = (pd_c[valid] - pd_l[valid]) / rng[valid]
     hh14 = pd.concat([out["high"].shift(1).rolling(13).max(), pd_h], axis=1).max(axis=1)
     ll14 = pd.concat([out["low"].shift(1).rolling(13).min(), pd_l], axis=1).min(axis=1)
     rng14 = (hh14 - ll14).replace(0, np.nan)
     out.loc[valid, "wr14"] = (-100 * (hh14 - pd_c) / rng14)[valid]
+
+    # RSI：用 pd_close 替换今日收益后滚动（近似，与日线口径一致）
+    close_proxy = out["close"].copy()
+    close_proxy.loc[valid] = pd_c[valid]
+    out.loc[valid, "rsi14"] = _rsi(close_proxy, 14)[valid]
+    out.loc[valid, "vol_20"] = (
+        close_proxy.pct_change().rolling(20).std() * np.sqrt(252)
+    )[valid]
 
     # ATR：用决策时点的 TR 替代当日
     prev_c = out["close"].shift(1)
@@ -412,16 +437,32 @@ def _csrank(s):
     return (r * 2 - 1).reindex(s.index)
 
 
-def composite_score(day_panel: pd.DataFrame, mom_w=0.7, bias_w=0.2) -> pd.Series:
+def composite_score(day_panel: pd.DataFrame, mom_w=0.7, bias_w=0.2,
+                    risk_w: float = 0.0, use_rsi_rev: bool = False,
+                    use_mom_120: bool = False) -> pd.Series:
     s_mom20 = _csrank(day_panel["mom_20"])
     s_mom60 = _csrank(day_panel["mom_60"])
+    if use_mom_120 and "mom_120" in day_panel.columns:
+        s_mom120 = _csrank(day_panel["mom_120"])
+        momentum_block = (s_mom20 + s_mom60 + s_mom120) / 3
+    else:
+        momentum_block = (s_mom20 + s_mom60) / 2
+
     s_ibs = -_csrank(day_panel["ibs"])
     s_wr = -_csrank(-day_panel["wr14"])
     s_rev = _csrank(day_panel["rev_5"])
+    rev_parts = [s_ibs, s_wr, s_rev]
+    if use_rsi_rev and "rsi14" in day_panel.columns:
+        # 低 RSI（超卖）→ 高分
+        rev_parts.append(-_csrank(day_panel["rsi14"]))
+    reversal_block = sum(rev_parts) / len(rev_parts)
+
     bias = day_panel["trend_up"].fillna(0.5) * 2 - 1
-    momentum_block = (s_mom20 + s_mom60) / 2
-    reversal_block = (s_ibs + s_wr + s_rev) / 3
-    return mom_w * momentum_block + (1 - mom_w) * reversal_block + bias_w * bias
+    score = mom_w * momentum_block + (1 - mom_w) * reversal_block + bias_w * bias
+    if risk_w and "vol_20" in day_panel.columns:
+        # 低波动 → 高分（利于压回撤 / 抬 Calmar）
+        score = score + risk_w * (-_csrank(day_panel["vol_20"]))
+    return score
 
 
 # ---------------- 回测引擎 ----------------
@@ -623,7 +664,12 @@ def run_backtest(panel: Dict[str, pd.DataFrame], cfg: Config,
             day_panel = pd.DataFrame(today_data).T
 
             scores = composite_score(
-                day_panel, mom_w=cfg.mom_weight, bias_w=cfg.bias_weight,
+                day_panel,
+                mom_w=cfg.mom_weight,
+                bias_w=cfg.bias_weight,
+                risk_w=cfg.risk_weight,
+                use_rsi_rev=cfg.use_rsi_rev,
+                use_mom_120=cfg.use_mom_120,
             ).dropna().sort_values(ascending=False)
             top_k = set(scores.head(cfg.k_long).index)
             bot_k = set(scores.tail(cfg.k_short).index) if cfg.k_short > 0 else set()
@@ -761,19 +807,40 @@ def run_backtest(panel: Dict[str, pd.DataFrame], cfg: Config,
 
 # ---------------- 评估与打印 ----------------
 
-def summarize(result: BacktestResult, cfg: Config,
-              benchmark: Optional[pd.Series] = None) -> dict:
+def metrics_raw(result: BacktestResult, cfg: Config) -> dict:
+    """返回原始浮点指标，供参数搜索使用。"""
     rets = result.daily_returns.dropna()
     n = len(rets)
     eq = result.equity
-    cum_ret = eq.iloc[-1] / cfg.starting_capital - 1 if n > 0 else 0
+    cum_ret = float(eq.iloc[-1] / cfg.starting_capital - 1) if n > 0 else 0.0
     years = n / 252
-    cagr = (1 + cum_ret) ** (1 / years) - 1 if years > 0 else 0
-    vol = rets.std() * np.sqrt(252) if rets.std() > 0 else 0
-    sharpe = rets.mean() * 252 / (rets.std() * np.sqrt(252)) if rets.std() > 0 else 0
+    cagr = float((1 + cum_ret) ** (1 / years) - 1) if years > 0 else 0.0
+    vol = float(rets.std() * np.sqrt(252)) if n and rets.std() > 0 else 0.0
+    sharpe = float(rets.mean() * 252 / (rets.std() * np.sqrt(252))) if n and rets.std() > 0 else 0.0
     dd = eq / eq.cummax() - 1
-    max_dd = dd.min() if n else 0
-    calmar = cagr / abs(max_dd) if max_dd < 0 else 0
+    max_dd = float(dd.min()) if n else 0.0
+    calmar = float(cagr / abs(max_dd)) if max_dd < 0 else 0.0
+    return {
+        "cum_ret": cum_ret,
+        "cagr": cagr,
+        "vol": vol,
+        "sharpe": sharpe,
+        "max_dd": max_dd,
+        "calmar": calmar,
+        "n_trades": len(result.trades),
+        "years": years,
+    }
+
+
+def summarize(result: BacktestResult, cfg: Config,
+              benchmark: Optional[pd.Series] = None) -> dict:
+    m = metrics_raw(result, cfg)
+    cum_ret, cagr, vol, sharpe, max_dd, calmar = (
+        m["cum_ret"], m["cagr"], m["vol"], m["sharpe"], m["max_dd"], m["calmar"],
+    )
+    n = len(result.daily_returns.dropna())
+    eq = result.equity
+    years = m["years"]
 
     trades = result.trades
     wins = [t for t in trades if t["pnl_pct"] > 0]

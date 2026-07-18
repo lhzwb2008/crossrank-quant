@@ -54,6 +54,7 @@ class LongportAPI:
     def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.quote_ctx: Optional[QuoteContext] = None
 
         init_retries = int(os.getenv('LONGPORT_INIT_RETRIES', '5'))
         init_base_delay = float(os.getenv('LONGPORT_INIT_RETRY_DELAY', '2.0'))
@@ -67,12 +68,35 @@ class LongportAPI:
                 break
             except Exception as e:
                 last_err = e
-                logger.warning('API 初始化失败 (%s/%s): %s',
-                               attempt + 1, init_retries, e)
+                msg = str(e)
+                if 'connections limitation' in msg.lower():
+                    logger.warning(
+                        'API 初始化失败 (%s/%s): 连接数打满 (limit=10)。'
+                        '请关闭其它占用 Longport 的进程/脚本后重试: %s',
+                        attempt + 1, init_retries, e,
+                    )
+                else:
+                    logger.warning('API 初始化失败 (%s/%s): %s',
+                                   attempt + 1, init_retries, e)
                 if attempt < init_retries - 1:
                     time.sleep(init_base_delay * (attempt + 1))
         if last_err is not None:
             raise last_err
+
+    def close(self) -> None:
+        """释放 QuoteContext，归还 Longport 连接配额。"""
+        ctx = self.quote_ctx
+        self.quote_ctx = None
+        if ctx is None:
+            return
+        for meth in ('close', 'shutdown', '__del__'):
+            fn = getattr(ctx, meth, None)
+            if callable(fn) and meth != '__del__':
+                try:
+                    fn()
+                    return
+                except Exception:
+                    pass
 
     def _call_with_retry(self, func, *args, **kwargs):
         for attempt in range(self.max_retries):
@@ -153,7 +177,21 @@ def get_api_singleton() -> LongportAPI:
     with _api_singleton_lock:
         if _api_singleton is None:
             _api_singleton = LongportAPI()
+            import atexit
+            atexit.register(close_api_singleton)
     return _api_singleton
+
+
+def close_api_singleton() -> None:
+    """显式关闭单例连接（多脚本连跑时建议在退出前调用）。"""
+    global _api_singleton
+    with _api_singleton_lock:
+        if _api_singleton is not None:
+            try:
+                _api_singleton.close()
+            finally:
+                _api_singleton = None
+            logger.info('Longport API 连接已释放')
 
 
 # -------- 对外接口（带本地 CSV 缓存）--------
