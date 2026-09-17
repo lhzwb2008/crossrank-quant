@@ -1,0 +1,4 @@
+{
+  "name": "crossrank-quant",
+  "install": "pip install --user -r requirements.txt"
+}
